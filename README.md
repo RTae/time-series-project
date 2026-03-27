@@ -10,3 +10,16 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 
 ## Installation
+
+1. Install the project dependencies using uv:
+```bash
+uv sync
+```
+
+2. source the virtual environment:
+```bash
+source .venv/bin/activate
+```
+
+## Example usage
+1. there is a notebook named `viz.ipynb` that contains code to visualize the data. You can run it using Jupyter Notebook

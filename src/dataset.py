@@ -109,6 +109,7 @@ class EEGImageNetDataset(Dataset):
         ]
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, Any]:
+        
         if self.use_image_label:
             path = self.data[index]["image"]
             image_path = os.path.join(self.dataset_dir, "imageNet_images", path.split('_')[0], path)
