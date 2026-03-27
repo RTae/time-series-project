@@ -116,9 +116,9 @@ class EEGImageNetDataset(Dataset):
                 if image.mode == "L":
                     image = image.convert("RGB")
                 label = self.transform(image) if self.transform else path
-            # print(f"{index} {path} {label.size()}")
         else:
             label = self.label_to_index[self.data[index]["label"]]
+
         if self.use_frequency_feat:
             feat = self.frequency_feat[index]
         else:
