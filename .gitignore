@@ -3,11 +3,9 @@
 /.idea/
 __pycache__/
 
-EEG-ImageNet.pth
-/data/de_feat/
-/data/imageNet_images/
-/output
-**plot**
-
 *.pt
 .venv/
+
+EEG-ImageNet.pth
+/output
+**plot**
