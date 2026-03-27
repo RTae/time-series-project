@@ -10,3 +10,4 @@ EEG-ImageNet.pth
 **plot**
 
 *.pt
+.venv/
