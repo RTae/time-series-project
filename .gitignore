@@ -3,7 +3,7 @@
 /.idea/
 __pycache__/
 
-*.pt
+*.pth
 .venv/
 
 EEG-ImageNet.pth

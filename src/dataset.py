@@ -1,60 +1,152 @@
-import numpy as np
-import torch
 import os
+import pickle
+from typing import Any, Callable
+
+import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
 
 class EEGImageNetDataset(Dataset):
-    def __init__(self, args, transform=None):
-        self.dataset_dir = args.dataset_dir
+    def __init__(
+        self,
+        dataset_dir: str,
+        transform: Callable[[Image.Image], Any] | None = None,
+        pth_name: str = "EEG-ImageNet.pth",
+        subject: int = -1,
+        granularity: str = "all",
+        eeg_window: tuple[int, int] = (40, 440),
+    ) -> None:
+        self.dataset_dir = dataset_dir
+        self.subject = subject
+        self.granularity = granularity
         self.transform = transform
-        loaded = torch.load(os.path.join(args.dataset_dir, "EEG-ImageNet.pth"))
+        self.eeg_window = eeg_window
+
+        loaded = self._load_checkpoint(os.path.join(self.dataset_dir, pth_name))
         self.labels = loaded["labels"]
         self.images = loaded["images"]
-        if args.subject != -1:
-            chosen_data = [loaded['dataset'][i] for i in range(len(loaded['dataset'])) if
-                           loaded['dataset'][i]['subject'] == args.subject]
-        else:
-            chosen_data = loaded['dataset']
-        if args.granularity == 'coarse':
-            self.data = [i for i in chosen_data if i['granularity'] == 'coarse']
-        elif args.granularity == 'all':
-            self.data = chosen_data
-        else:
-            fine_num = int(args.granularity[-1])
-            fine_category_range = np.arange(8 * fine_num, 8 * fine_num + 8)
-            self.data = [i for i in chosen_data if
-                         i['granularity'] == 'fine' and self.labels.index(i['label']) in fine_category_range]
+        self.label_to_index = {label: idx for idx, label in enumerate(self.labels)}
+
+        chosen_data = self._filter_subject(loaded["dataset"], self.subject)
+        self.data = self._filter_granularity(chosen_data, self.granularity)
+
         self.use_frequency_feat = False
         self.frequency_feat = None
         self.use_image_label = False
 
-    def __getitem__(self, index):
+    @classmethod
+    def from_args(
+        cls,
+        args: Any,
+        transform: Callable[[Image.Image], Any] | None = None,
+        pth_name: str = "EEG-ImageNet.pth",
+        eeg_window: tuple[int, int] = (40, 440),
+    ) -> "EEGImageNetDataset":
+        dataset_dir = cls._read_opt(args, "dataset_dir", required=True)
+        subject = cls._read_opt(args, "subject", default=-1)
+        granularity = cls._read_opt(args, "granularity", default="all")
+        return cls(
+            dataset_dir=dataset_dir,
+            transform=transform,
+            pth_name=pth_name,
+            subject=subject,
+            granularity=granularity,
+            eeg_window=eeg_window,
+        )
+
+    @staticmethod
+    def _read_opt(args: Any, name: str, default: Any = None, required: bool = False) -> Any:
+        if args is not None:
+            if isinstance(args, dict) and name in args:
+                return args[name]
+            if hasattr(args, name):
+                return getattr(args, name)
+        if required:
+            raise ValueError(f"Missing required option '{name}'.")
+        return default
+
+    @staticmethod
+    def _load_checkpoint(path: str) -> dict[str, Any]:
+        try:
+            # Prefer safe loading mode introduced in newer PyTorch versions.
+            return torch.load(path, map_location="cpu", weights_only=True)
+        except pickle.UnpicklingError:
+            # Fallback for legacy checkpoints. Use only for trusted files.
+            return torch.load(path, map_location="cpu", weights_only=False)
+
+    def _filter_subject(self, dataset: list[dict[str, Any]], subject: int) -> list[dict[str, Any]]:
+        if subject == -1:
+            return dataset
+        return [item for item in dataset if item.get("subject") == subject]
+
+    def _filter_granularity(self, dataset: list[dict[str, Any]], granularity: str) -> list[dict[str, Any]]:
+        if granularity == "all":
+            return dataset
+        if granularity == "coarse":
+            return [item for item in dataset if item.get("granularity") == "coarse"]
+        if granularity == "fine":
+            return [item for item in dataset if item.get("granularity") == "fine"]
+
+        # Support grouped fine categories like "fine0", "fine1", etc.
+        if isinstance(granularity, str) and granularity.startswith("fine") and granularity[4:].isdigit():
+            fine_num = int(granularity[4:])
+        elif isinstance(granularity, str) and granularity[-1].isdigit():
+            # Keep compatibility with previous behavior for values like "granularity3".
+            fine_num = int(granularity[-1])
+        else:
+            raise ValueError(
+                "Invalid granularity. Expected one of: 'all', 'coarse', 'fine', 'fineN' (e.g. fine3)."
+            )
+
+        start = 8 * fine_num
+        end = start + 8
+        return [
+            item
+            for item in dataset
+            if item.get("granularity") == "fine"
+            and start <= self.label_to_index.get(item.get("label"), -1) < end
+        ]
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, Any]:
         if self.use_image_label:
             path = self.data[index]["image"]
-            label = Image.open(os.path.join(self.dataset_dir, "imageNet_images", path.split('_')[0], path))
-            if label.mode == 'L':
-                label = label.convert('RGB')
-            if self.transform:
-                label = self.transform(label)
-            else:
-                label = path
+            image_path = os.path.join(self.dataset_dir, "imageNet_images", path.split('_')[0], path)
+            with Image.open(image_path) as image:
+                if image.mode == "L":
+                    image = image.convert("RGB")
+                label = self.transform(image) if self.transform else path
             # print(f"{index} {path} {label.size()}")
         else:
-            label = self.labels.index(self.data[index]["label"])
+            label = self.label_to_index[self.data[index]["label"]]
         if self.use_frequency_feat:
             feat = self.frequency_feat[index]
         else:
             eeg_data = self.data[index]["eeg_data"].float()
-            feat = eeg_data[:, 40:440]
+            start, end = self.eeg_window
+            feat = eeg_data[:, start:end]
         return feat, label
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.data)
 
-    def add_frequency_feat(self, feat):
-        if len(feat) == len(self.data):
-            self.frequency_feat = torch.from_numpy(feat).float()
-        else:
+    def add_frequency_feat(self, feat: Any) -> None:
+        self.set_frequency_feat(feat)
+
+    def set_frequency_feat(self, feat: Any) -> None:
+        if len(feat) != len(self.data):
             raise ValueError("Frequency features must have same length")
+        if isinstance(feat, torch.Tensor):
+            self.frequency_feat = feat.float()
+        else:
+            self.frequency_feat = torch.as_tensor(feat).float()
+        self.use_frequency_feat = True
+
+    def clear_frequency_feat(self) -> None:
+        self.frequency_feat = None
+        self.use_frequency_feat = False
+
+    def set_label_mode(self, mode: str) -> None:
+        if mode not in ("index", "image"):
+            raise ValueError("label mode must be 'index' or 'image'")
+        self.use_image_label = mode == "image"
