@@ -15,7 +15,9 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 # Add project root to sys.path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+demo_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(demo_dir)
+sys.path.insert(0, project_root)
 
 from src.dataset import ThingsEEGDataset
 from src.models.supaeeg import SUPAEEG
@@ -23,29 +25,67 @@ from src.encoders.vision_encoder import InternViTFeatureLookup
 from src.utilities import Config, make_model
 
 # ---------------------------------------------------------------------------
-# HARDCODED CONFIGURATION
+# DYNAMIC SELECTIONS DEFAULT CONFIGURATION
 # ---------------------------------------------------------------------------
-CHECKPOINT_PATH = "intra/supaeeg_intra_sub01.pt"  # Path to your trained model checkpoint
-SUBJECT = 1                                       # Subject ID (1 to 10)
-CONCEPT = "00197_wheelchair"                      # Target concept from the test set
+DEFAULT_SUBJECT = 1
+DEFAULT_PROTOCOL = "intra"
+DEFAULT_CONCEPT = "00197_wheelchair"
+DEFAULT_AVERAGE = "true"
 # ---------------------------------------------------------------------------
+
+_dataset_cache = {}
 
 def load_config() -> Config:
     from omegaconf import OmegaConf
-    cfg = OmegaConf.load("conf/config.yaml")
+    demo_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(demo_dir)
+    cfg = OmegaConf.load(os.path.join(project_root, "conf", "config.yaml"))
     config = Config()
     for field_name in config.__dataclass_fields__:
         if hasattr(cfg, field_name):
             setattr(config, field_name, getattr(cfg, field_name))
+    # Make relative dataset/internvit paths absolute based on project_root
+    if not os.path.isabs(config.dataset_dir):
+        config.dataset_dir = os.path.abspath(os.path.join(project_root, config.dataset_dir))
+    if not os.path.isabs(config.internvit_dir):
+        config.internvit_dir = os.path.abspath(os.path.join(project_root, config.internvit_dir))
     return config
 
 
-def plot_eeg(eeg_tensor: torch.Tensor) -> str:
+def get_dataset(subject: int, config: Config) -> ThingsEEGDataset:
+    if subject not in _dataset_cache:
+        _dataset_cache[subject] = ThingsEEGDataset(
+            dataset_dir=config.dataset_dir,
+            data_type="test",
+            subject=subject,
+            load_images=False,
+            data_average=config.data_average_test
+        )
+    return _dataset_cache[subject]
+
+
+def get_checkpoint_path(protocol: str, subject: int) -> str:
+    demo_dir = os.path.dirname(os.path.abspath(__file__))
+    if protocol == "intra":
+        path = os.path.join(demo_dir, "intra_full", "intra", f"supaeeg_intra_sub{subject:02d}.pt")
+    elif protocol == "inter":
+        path = os.path.join(demo_dir, "inter_full", "outputs", "2026-06-06", "inter", f"supaeeg_loso_sub{subject:02d}.pt")
+    else:
+        raise ValueError(f"Unknown protocol: {protocol}")
+    
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Checkpoint file not found: {path}")
+    return path
+
+
+def plot_eeg(eeg_tensor: torch.Tensor, is_averaged: bool) -> str:
     fig, ax = plt.subplots(figsize=(6, 3))
     data = eeg_tensor.numpy()
     for i in range(data.shape[0]):
         ax.plot(data[i] + i * 3.0, linewidth=1)
-    ax.set_title("EEG Signal")
+    
+    title = "EEG Signal (Averaged ERP)" if is_averaged else "EEG Signal (Single Trial - Noisy)"
+    ax.set_title(title)
     ax.set_xlabel("Time (ms)")
     ax.set_ylabel("Channels")
     plt.tight_layout()
@@ -58,14 +98,8 @@ def plot_eeg(eeg_tensor: torch.Tensor) -> str:
 def run_inference(subject: int, target_concept: str, checkpoint_path: str) -> dict:
     config = load_config()
     
-    # Load test dataset
-    dataset = ThingsEEGDataset(
-        dataset_dir=config.dataset_dir,
-        data_type="test",
-        subject=subject,
-        load_images=False,
-        data_average=config.data_average_test
-    )
+    # Load cached or new test dataset
+    dataset = get_dataset(subject, config)
     
     # Initialize model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -88,7 +122,7 @@ def run_inference(subject: int, target_concept: str, checkpoint_path: str) -> di
     # Get the 80 trials for this concept (using the repetitions factor)
     indices = [concept_idx * dataset.number_of_repetitions + r for r in range(dataset.number_of_repetitions)]
     
-    # Load all EEG trials for this concept
+    # Load all EEG trials for this concept (always averaged for decoder)
     eeg_tensors = []
     target_file = None
     for idx in indices:
@@ -143,11 +177,21 @@ def run_inference(subject: int, target_concept: str, checkpoint_path: str) -> di
     }
 
 # ---------------------------------------------------------------------------
+# Load test concepts once on server start
+# ---------------------------------------------------------------------------
+try:
+    _startup_config = load_config()
+    _startup_dataset = get_dataset(DEFAULT_SUBJECT, _startup_config)
+    ALL_CONCEPTS = sorted(list(set(_startup_dataset.image_meta_data['test_img_concepts'])))
+except Exception as e:
+    print(f"Warning: Failed to load dataset concepts: {e}")
+    ALL_CONCEPTS = []
+
+# ---------------------------------------------------------------------------
 # HTTP Web Server
 # ---------------------------------------------------------------------------
 
 class DemoHTTPHandler(BaseHTTPRequestHandler):
-        
     def do_GET(self) -> None:
         url = urllib.parse.urlparse(self.path)
         path = url.path
@@ -161,42 +205,46 @@ class DemoHTTPHandler(BaseHTTPRequestHandler):
             
         elif path == "/api/meta":
             self.send_json({
-                "subject": SUBJECT,
-                "concept": CONCEPT,
-                "checkpoint": CHECKPOINT_PATH
+                "default_subject": DEFAULT_SUBJECT,
+                "default_concept": DEFAULT_CONCEPT,
+                "default_protocol": DEFAULT_PROTOCOL,
+                "default_average": DEFAULT_AVERAGE,
+                "concepts": ALL_CONCEPTS
             })
             
         elif path == "/api/sample":
             try:
+                subject = int(query.get("subject", [str(DEFAULT_SUBJECT)])[0])
+                concept = query.get("concept", [DEFAULT_CONCEPT])[0]
+                average = query.get("average", ["true"])[0].lower() == "true"
+                
                 config = load_config()
-                dataset = ThingsEEGDataset(
-                    dataset_dir=config.dataset_dir,
-                    data_type="test",
-                    subject=SUBJECT,
-                    load_images=False,
-                    data_average=config.data_average_test
-                )
+                dataset = get_dataset(subject, config)
                 
                 # Find the correct concept index in the 200 test set concepts
                 concept_idx = -1
                 for i, c in enumerate(dataset.image_meta_data['test_img_concepts']):
-                    if c == CONCEPT:
+                    if c == concept:
                         concept_idx = i
                         break
                 if concept_idx == -1:
-                    raise ValueError(f"Concept '{CONCEPT}' not found in the test dataset split")
+                    raise ValueError(f"Concept '{concept}' not found in the test dataset split")
                 
                 # Get the 80 trials for this concept (using the repetitions factor)
                 indices = [concept_idx * dataset.number_of_repetitions + r for r in range(dataset.number_of_repetitions)]
                 
-                # Average the EEG traces across all trials for a clean ERP visualization
-                eeg_traces = [dataset[idx][0] for idx in indices]
-                eeg_average = torch.stack(eeg_traces).mean(dim=0)
+                if average:
+                    # Average the EEG traces across all trials for a clean ERP visualization
+                    eeg_traces = [dataset[idx][0] for idx in indices]
+                    eeg_display = torch.stack(eeg_traces).mean(dim=0)
+                else:
+                    # Load only the first trial (repetition index 0)
+                    eeg_display, _, _, _, _, _, _ = dataset[indices[0]]
                 
                 # Use the target image file from the first trial sample
                 _, _, _, _, _, _, image_file = dataset[indices[0]]
                 
-                eeg_plot = plot_eeg(eeg_average)
+                eeg_plot = plot_eeg(eeg_display, average)
                 
                 self.send_json({
                     "image_file": image_file,
@@ -207,7 +255,12 @@ class DemoHTTPHandler(BaseHTTPRequestHandler):
                 
         elif path == "/api/decode":
             try:
-                res = run_inference(SUBJECT, CONCEPT, CHECKPOINT_PATH)
+                subject = int(query.get("subject", [str(DEFAULT_SUBJECT)])[0])
+                concept = query.get("concept", [DEFAULT_CONCEPT])[0]
+                protocol = query.get("protocol", [DEFAULT_PROTOCOL])[0]
+                
+                checkpoint_path = get_checkpoint_path(protocol, subject)
+                res = run_inference(subject, concept, checkpoint_path)
                 self.send_json(res)
             except Exception as e:
                 self.send_json({"error": str(e)})
@@ -216,8 +269,8 @@ class DemoHTTPHandler(BaseHTTPRequestHandler):
             concept = query.get("concept", [""])[0]
             image_file = query.get("file", [""])[0]
             
-            project_root = os.path.dirname(os.path.abspath(__file__))
-            img_dir = os.path.join(project_root, "data/things_eeg", "test_images")
+            config = load_config()
+            img_dir = os.path.join(config.dataset_dir, "test_images")
             img_path = os.path.join(img_dir, concept, image_file)
             
             if os.path.isfile(img_path):
@@ -253,15 +306,34 @@ HTML_CONTENT = """<!DOCTYPE html>
             background-color: #f8f9fa;
             color: #333;
         }
-        h1 {
-            border-bottom: 2px solid #ddd;
-            padding-bottom: 10px;
-        }
-        .meta-info {
-            background-color: #e9ecef;
-            padding: 10px 15px;
+        .control-panel {
+            background-color: #fff;
+            border: 1px solid #ddd;
             border-radius: 4px;
+            padding: 15px 20px;
             margin-bottom: 20px;
+            display: flex;
+            gap: 20px;
+            align-items: center;
+        }
+        .control-group {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+            flex: 1;
+        }
+        .control-group label {
+            font-weight: bold;
+            font-size: 14px;
+            color: #555;
+        }
+        .control-group select {
+            padding: 8px 12px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            background-color: #fff;
+            font-size: 14px;
+            cursor: pointer;
         }
         .container {
             display: flex;
@@ -320,10 +392,45 @@ HTML_CONTENT = """<!DOCTYPE html>
     </style>
 </head>
 <body>
-    <h1>SUPAEEG Visual Decoding Demo</h1>
-    
-    <div class="meta-info" id="meta-info">
-        Loading configuration...
+    <div class="control-panel">
+        <div class="control-group">
+            <label for="select-subject">Subject</label>
+            <select id="select-subject">
+                <option value="1">Subject 1</option>
+                <option value="2">Subject 2</option>
+                <option value="3">Subject 3</option>
+                <option value="4">Subject 4</option>
+                <option value="5">Subject 5</option>
+                <option value="6">Subject 6</option>
+                <option value="7">Subject 7</option>
+                <option value="8">Subject 8</option>
+                <option value="9">Subject 9</option>
+                <option value="10">Subject 10</option>
+            </select>
+        </div>
+        
+        <div class="control-group">
+            <label for="select-protocol">Alignment Protocol</label>
+            <select id="select-protocol">
+                <option value="intra">Intra-Subject</option>
+                <option value="inter">Cross-Subject / LOSO</option>
+            </select>
+        </div>
+        
+        <div class="control-group">
+            <label for="select-concept">Target Concept</label>
+            <select id="select-concept">
+                <!-- Populated dynamically -->
+            </select>
+        </div>
+        
+        <div class="control-group">
+            <label for="select-average">EEG Trial Mode</label>
+            <select id="select-average">
+                <option value="true">Averaged ERP (80 Trials)</option>
+                <option value="false">Single Trial (Noisy Run)</option>
+            </select>
+        </div>
     </div>
     
     <div class="container">
@@ -356,48 +463,92 @@ HTML_CONTENT = """<!DOCTYPE html>
     </div>
 
     <script>
-        const metaInfo = document.getElementById('meta-info');
+        const selectSubject = document.getElementById('select-subject');
+        const selectProtocol = document.getElementById('select-protocol');
+        const selectConcept = document.getElementById('select-concept');
+        const selectAverage = document.getElementById('select-average');
+        
         const eegPlotContainer = document.getElementById('eeg-plot-container');
         const targetImageContainer = document.getElementById('target-image-container');
         const btnDecode = document.getElementById('btn-decode');
         const resultsContainer = document.getElementById('results-container');
         
-        let targetConcept = "";
-        
+        // Initial setup
         window.addEventListener('DOMContentLoaded', async () => {
             try {
                 const configRes = await fetch('/api/meta');
                 const configData = await configRes.json();
-                targetConcept = configData.concept;
                 
-                metaInfo.innerHTML = `
-                    <strong>Subject:</strong> Subject ${configData.subject} | 
-                    <strong>Target Concept:</strong> ${configData.concept} | 
-                    <strong>Checkpoint:</strong> ${configData.checkpoint}
-                `;
+                // Populate unique concept selector
+                selectConcept.innerHTML = '';
+                configData.concepts.forEach(c => {
+                    const option = document.createElement('option');
+                    option.value = c;
+                    option.innerText = c;
+                    selectConcept.appendChild(option);
+                });
                 
-                const sampleRes = await fetch('/api/sample');
+                // Set default form values
+                selectSubject.value = configData.default_subject;
+                selectProtocol.value = configData.default_protocol;
+                selectConcept.value = configData.default_concept;
+                selectAverage.value = configData.default_average;
+                
+                // Set change listeners
+                selectSubject.addEventListener('change', loadSample);
+                selectProtocol.addEventListener('change', loadSample);
+                selectConcept.addEventListener('change', loadSample);
+                selectAverage.addEventListener('change', loadSample);
+                
+                await loadSample();
+            } catch (e) {
+                console.error("Failed to load server configuration:", e);
+            }
+        });
+        
+        async function loadSample() {
+            const subject = selectSubject.value;
+            const protocol = selectProtocol.value;
+            const concept = selectConcept.value;
+            const average = selectAverage.value;
+            
+            // Clear prior results/images
+            resultsContainer.innerHTML = 'Click button to decode EEG signal.';
+            eegPlotContainer.innerHTML = 'Loading EEG...';
+            targetImageContainer.innerHTML = 'Loading Target Image...';
+            
+            try {
+                const sampleRes = await fetch(`/api/sample?subject=${subject}&concept=${concept}&average=${average}`);
                 const sampleData = await sampleRes.json();
+                
+                if (sampleData.error) {
+                    eegPlotContainer.innerHTML = `<span style="color:red;">Error: ${sampleData.error}</span>`;
+                    targetImageContainer.innerHTML = `<span style="color:red;">Error: ${sampleData.error}</span>`;
+                    return;
+                }
                 
                 eegPlotContainer.innerHTML = `<img src="data:image/png;base64,${sampleData.eeg_plot}" alt="EEG">`;
                 
-                const imgUrl = `/api/image?concept=${configData.concept}&file=${sampleData.image_file}`;
-                targetImageContainer.innerHTML = `<img src="${imgUrl}" alt="${configData.concept}"><br><strong>${configData.concept}</strong>`;
+                const imgUrl = `/api/image?concept=${concept}&file=${sampleData.image_file}`;
+                targetImageContainer.innerHTML = `<img src="${imgUrl}" alt="${concept}"><br><strong>${concept}</strong>`;
             } catch (e) {
-                metaInfo.innerHTML = '<span style="color:red;">Failed to load server configuration. Make sure data paths are correct.</span>';
                 eegPlotContainer.innerHTML = "Error loading EEG";
                 targetImageContainer.innerHTML = "Error loading Image";
                 console.error(e);
             }
-        });
+        }
         
         btnDecode.addEventListener('click', async () => {
+            const subject = selectSubject.value;
+            const protocol = selectProtocol.value;
+            const concept = selectConcept.value;
+            
             btnDecode.disabled = true;
             btnDecode.innerText = "Decoding...";
             resultsContainer.innerHTML = "Running model inference...";
             
             try {
-                const res = await fetch('/api/decode');
+                const res = await fetch(`/api/decode?subject=${subject}&concept=${concept}&protocol=${protocol}`);
                 const data = await res.json();
                 
                 if (data.error) {
@@ -408,7 +559,7 @@ HTML_CONTENT = """<!DOCTYPE html>
                 resultsContainer.innerHTML = '';
                 data.results.forEach(item => {
                     const imgUrl = `/api/image?concept=${item.concept}&file=${item.image_file}`;
-                    const isCorrect = item.concept === targetConcept;
+                    const isCorrect = item.concept === concept;
                     const style = isCorrect ? 'background-color: #d4edda; border: 1px solid #c3e6cb;' : '';
                     
                     const div = document.createElement('div');

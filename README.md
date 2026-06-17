@@ -395,5 +395,5 @@ bash scripts/download_model.sh
 
 3. Run the demo script to perform zero-shot decoding on the test set and print retrieval metrics:
 ```bash
-python demo.py
+python demo/demo.py
 ```

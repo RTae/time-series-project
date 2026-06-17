@@ -20,7 +20,11 @@ from src.dataset import ThingsEEGDataset
 
 def _make_npy(raw: np.ndarray) -> dict:
     """Wrap a raw array in the dict format _load_eeg_data expects."""
-    return {"preprocessed_eeg_data": raw}
+    times = -0.2 + np.arange(raw.shape[-1]) * 0.01
+    return {
+        "preprocessed_eeg_data": raw,
+        "times": times
+    }
 
 
 def _run_load(raw: np.ndarray, data_average: bool):

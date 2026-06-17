@@ -84,6 +84,7 @@ def _load_train_module():
         make_model=lambda *args, **kwargs: None,
         make_optimizer=lambda *args, **kwargs: None,
         save_checkpoint=lambda *args, **kwargs: None,
+        set_seed=lambda *args, **kwargs: None,
         train_one_epoch=lambda *args, **kwargs: None,
     )
 

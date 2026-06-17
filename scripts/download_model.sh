@@ -2,7 +2,7 @@
 set -e
 
 BASE="https://cloud.tsinghua.edu.cn"
-DIR="outputs/"
+DIR="demo"
 
 if ! command -v aria2c >/dev/null 2>&1; then
   echo "aria2c is required but was not found in PATH."
@@ -44,7 +44,7 @@ download "f/be070877300048f887fd" "$DIR/intra_model.zip"
 # Download the inter-subject model
 download "f/ac98b644dc814aa0bc46" "$DIR/inter_model.zip"
 
-unzip -o "$DIR/intra_model.zip" -d "$DIR/intra_model"
-unzip -o "$DIR/inter_model.zip" -d "$DIR/inter_model"
+unzip -o "$DIR/intra_model.zip" -d "$DIR/intra_full"
+unzip -o "$DIR/inter_model.zip" -d "$DIR/inter_full"
 
 echo "Done."
