@@ -384,3 +384,16 @@ feature distributions interactively.
 ## Experimental Analysis
 
 Please refer to `reports/experiment.md` for detailed analysis of results.
+
+## Demo
+1. Download the dataset, please follow the instructions in the [Data](#data) section above to download the preprocessed EEG data and images.
+   
+2. Download the trained model
+```bash
+bash scripts/download_model.sh
+```
+
+3. Run the demo script to perform zero-shot decoding on the test set and print retrieval metrics:
+```bash
+python demo.py
+```
