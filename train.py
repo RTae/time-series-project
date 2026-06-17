@@ -20,6 +20,7 @@ from src.utilities import (
     make_model,
     make_optimizer,
     save_checkpoint,
+    set_seed,
     train_one_epoch,
 )
 
@@ -88,7 +89,6 @@ class _SubjectIDDataset(Dataset):
 # ---------------------------------------------------------------------------
 # Config conversion
 # ---------------------------------------------------------------------------
-
 def _cfg_to_config(cfg: DictConfig) -> Config:
     """Convert a Hydra DictConfig into the Config dataclass used by the runners."""
     return Config(
@@ -127,14 +127,28 @@ def _cfg_to_config(cfg: DictConfig) -> Config:
         metadata_path=cfg.metadata_path,
         data_average=cfg.data_average,
         data_average_test=cfg.data_average_test,
+        eeg_suffix=cfg.eeg_suffix,
+        eeg_t_start=cfg.eeg_t_start,
+        eeg_t_end=cfg.eeg_t_end,
+        smooth_prob=cfg.smooth_prob,
+        smooth_kernel_size=cfg.smooth_kernel_size,
+        smooth_sigma=cfg.smooth_sigma,
+        early_stop_patience=cfg.early_stop_patience,
+        warmup_epochs=cfg.warmup_epochs,
+        seed=cfg.seed,
+        share_encoder_type=cfg.share_encoder_type,
+        eeg_encoder_type=cfg.eeg_encoder_type,
+        image_layer_mode=cfg.image_layer_mode,
+        image_layer_index=cfg.image_layer_index,
+        temporal_compression=cfg.temporal_compression,
+        image_feature_path=cfg.image_feature_path,
+        skip_feature_extraction=cfg.skip_feature_extraction,
     )
 
 
 # ---------------------------------------------------------------------------
 # Protocol runners
 # ---------------------------------------------------------------------------
-
-
 def run_intra_subject(
     config: Config,
     internvit_lookup: InternViTFeatureLookup,
@@ -167,16 +181,33 @@ def run_intra_subject(
             dataset_dir=config.dataset_dir,
             data_type="train",
             subject=subject_id,
-            load_images=False, # since we already have the vision features, no need to load pixel data
+            load_images=False,
             data_average=config.data_average,
+            eeg_t_start=config.eeg_t_start,
+            eeg_t_end=config.eeg_t_end,
+            eeg_suffix=config.eeg_suffix,
         )
         test_dataset = ThingsEEGDataset(
             dataset_dir=config.dataset_dir,
             data_type="test",
             subject=subject_id,
-            load_images=False, # since we already have the vision features, no need to load pixel data
+            load_images=False,
             data_average=config.data_average_test,
+            eeg_t_start=config.eeg_t_start,
+            eeg_t_end=config.eeg_t_end,
+            eeg_suffix=config.eeg_suffix,
         )
+        if train_dataset.eeg_data is not None:
+            actual_channels    = train_dataset.eeg_data.shape[1]
+            actual_timepoints  = train_dataset.eeg_data.shape[2]
+            if actual_channels != config.n_channels or actual_timepoints != config.n_timepoints:
+                raise ValueError(
+                    f"Subject {subject_id}: loaded EEG shape "
+                    f"(n_channels={actual_channels}, n_timepoints={actual_timepoints}) "
+                    f"does not match config "
+                    f"(n_channels={config.n_channels}, n_timepoints={config.n_timepoints}). "
+                    "Check eeg_suffix, eeg_t_start, and eeg_t_end settings."
+                )
         train_loader = DataLoader(
             train_dataset,
             batch_size=config.batch_size,
@@ -195,8 +226,12 @@ def run_intra_subject(
 
         model     = make_model(config, device)
         optimizer = make_optimizer(model, config)
+        from src.utilities import make_scheduler
+        scheduler = make_scheduler(optimizer, config)
+        scheduler.step(0)  # set initial warmup LR before epoch 1
         best_top1 = 0.0
         best_top5 = 0.0
+        no_improve = 0   # early-stop counter (stage 2 only)
 
         metrics_path = os.path.join(output_dir, f"metrics_sub{subject_id:02d}.csv")
         metrics_file = open(metrics_path, "w", newline="")
@@ -223,6 +258,8 @@ def run_intra_subject(
             writer.add_scalar("train/infonce",    components["infonce"],    epoch)
             writer.add_scalar("train/mmd",        components["mmd"],        epoch)
             writer.add_scalar("train/mmd_weight", components["mmd_weight"], epoch)
+            scheduler.step()
+            writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], epoch)
 
             row: dict[str, Any] = {
                 "epoch":      epoch,
@@ -247,10 +284,21 @@ def run_intra_subject(
                 if top1 > best_top1:
                     best_top1 = top1
                     best_top5 = top5
+                    no_improve = 0
                     save_checkpoint(
                         model, optimizer, epoch, top1, top5,
                         path=os.path.join(output_dir, f"supaeeg_intra_sub{subject_id:02d}.pt"),
                     )
+                elif epoch > config.stage1_epochs:
+                    no_improve += 1
+                    if no_improve >= config.early_stop_patience:
+                        logger.info(
+                            f"Sub{subject_id:02d} | early stop at epoch {epoch} "
+                            f"(no improvement for {no_improve} eval rounds in stage 2)"
+                        )
+                        csv_writer.writerow(row)
+                        metrics_file.flush()
+                        break
 
             csv_writer.writerow(row)
             metrics_file.flush()
@@ -262,7 +310,7 @@ def run_intra_subject(
         all_results[subject_id] = {"top1": best_top1, "top5": best_top5}
 
         # Free GPU memory before the next subject
-        del model, optimizer, train_loader, test_loader, train_dataset, test_dataset
+        del model, optimizer, scheduler, train_loader, test_loader, train_dataset, test_dataset
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -295,7 +343,11 @@ def run_inter_subject(
     """
     all_results: dict[int, dict[str, float]] = {}
 
-    for test_subject in config.all_subjects:
+    test_subjects = (
+        [config.subject] if config.subject != -1 else config.all_subjects
+    )
+
+    for test_subject in test_subjects:
         train_subjects = [s for s in config.all_subjects if s != test_subject]
         logger.info(
             f"LOSO | test_subject={test_subject} | train_subjects={train_subjects}"
@@ -308,8 +360,11 @@ def run_inter_subject(
                         dataset_dir=config.dataset_dir,
                         data_type="train",
                         subject=s,
-                        load_images=False, # since we already have the vision features, no need to load pixel data
+                        load_images=False,
                         data_average=config.data_average,
+                        eeg_t_start=config.eeg_t_start,
+                        eeg_t_end=config.eeg_t_end,
+                        eeg_suffix=config.eeg_suffix,
                     ),
                     subject_id=s,
                 )
@@ -320,9 +375,25 @@ def run_inter_subject(
             dataset_dir=config.dataset_dir,
             data_type="test",
             subject=test_subject,
-            load_images=False, # since we already have the vision features, no need to load pixel data
+            load_images=False,
             data_average=config.data_average_test,
+            eeg_t_start=config.eeg_t_start,
+            eeg_t_end=config.eeg_t_end,
+            eeg_suffix=config.eeg_suffix,
         )
+        # ConcatDataset wraps _SubjectIDDataset(ThingsEEGDataset(...)), so drill in
+        _first_ds = train_dataset.datasets[0].dataset
+        if _first_ds.eeg_data is not None:
+            actual_channels    = _first_ds.eeg_data.shape[1]
+            actual_timepoints  = _first_ds.eeg_data.shape[2]
+            if actual_channels != config.n_channels or actual_timepoints != config.n_timepoints:
+                raise ValueError(
+                    f"LOSO test_subject {test_subject}: loaded EEG shape "
+                    f"(n_channels={actual_channels}, n_timepoints={actual_timepoints}) "
+                    f"does not match config "
+                    f"(n_channels={config.n_channels}, n_timepoints={config.n_timepoints}). "
+                    "Check eeg_suffix, eeg_t_start, and eeg_t_end settings."
+                )
         train_loader = DataLoader(
             train_dataset,
             batch_size=config.batch_size,
@@ -341,8 +412,12 @@ def run_inter_subject(
 
         model     = make_model(config, device)
         optimizer = make_optimizer(model, config)
+        from src.utilities import make_scheduler
+        scheduler = make_scheduler(optimizer, config)
+        scheduler.step(0)  # set initial warmup LR before epoch 1
         best_top1 = 0.0
         best_top5 = 0.0
+        no_improve = 0   # early-stop counter (stage 2 only)
 
         metrics_path = os.path.join(output_dir, f"metrics_loso_sub{test_subject:02d}.csv")
         metrics_file = open(metrics_path, "w", newline="")
@@ -369,6 +444,8 @@ def run_inter_subject(
             writer.add_scalar("train/infonce",    components["infonce"],    epoch)
             writer.add_scalar("train/mmd",        components["mmd"],        epoch)
             writer.add_scalar("train/mmd_weight", components["mmd_weight"], epoch)
+            scheduler.step()
+            writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], epoch)
 
             row: dict[str, Any] = {
                 "epoch":      epoch,
@@ -393,10 +470,21 @@ def run_inter_subject(
                 if top1 > best_top1:
                     best_top1 = top1
                     best_top5 = top5
+                    no_improve = 0
                     save_checkpoint(
                         model, optimizer, epoch, top1, top5,
                         path=os.path.join(output_dir, f"supaeeg_loso_sub{test_subject:02d}.pt"),
                     )
+                elif epoch > config.stage1_epochs:
+                    no_improve += 1
+                    if no_improve >= config.early_stop_patience:
+                        logger.info(
+                            f"LOSO test=Sub{test_subject:02d} | early stop at epoch {epoch} "
+                            f"(no improvement for {no_improve} eval rounds in stage 2)"
+                        )
+                        csv_writer.writerow(row)
+                        metrics_file.flush()
+                        break
 
             csv_writer.writerow(row)
             metrics_file.flush()
@@ -408,7 +496,7 @@ def run_inter_subject(
         all_results[test_subject] = {"top1": best_top1, "top5": best_top5}
 
         # Free GPU memory before the next fold
-        del model, optimizer, train_loader, test_loader, train_dataset, test_dataset
+        del model, optimizer, scheduler, train_loader, test_loader, train_dataset, test_dataset
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -417,17 +505,9 @@ def run_inter_subject(
     log_results_table(all_results, avg_top1, avg_top5, protocol="inter")
     return all_results
 
-
-# ---------------------------------------------------------------------------
-# Typer entry point
-# ---------------------------------------------------------------------------
-
-
 # ---------------------------------------------------------------------------
 # Hydra entry point
 # ---------------------------------------------------------------------------
-
-
 @hydra.main(config_path="conf", config_name="config", version_base=None)
 def train(cfg: DictConfig) -> None:
     """Train SUPAEEG on THINGS-EEG2 using the intra- or inter-subject protocol.
@@ -441,6 +521,10 @@ def train(cfg: DictConfig) -> None:
 
     if config.protocol not in ("intra", "inter"):
         raise ValueError(f"protocol must be 'intra' or 'inter', got {config.protocol!r}")
+
+    if config.seed >= 0:
+        set_seed(config.seed)
+        logger.info(f"Random seed set to {config.seed}")
 
     logger.info("\n" + OmegaConf.to_yaml(cfg))
 
@@ -458,23 +542,37 @@ def train(cfg: DictConfig) -> None:
 
     # Ensure InternViT features are present (no-op if already extracted)
     from src.encoders.vision_encoder import ensure_internvit_features
-    ensure_internvit_features(
-        internvit_dir  = config.internvit_dir,
-        layer_ids      = config.layer_ids,
-        train_img_dir  = config.train_img_dir,
-        test_img_dir   = config.test_img_dir,
-        model_name     = config.internvit_model,
-        device         = str(_device),
-        batch_size     = int(cfg.extract_batch_size),
+    feature_path = config.image_feature_path or os.path.join(
+        config.internvit_dir, "internvit_features.npy"
     )
+    if not os.path.isfile(feature_path):
+        if config.skip_feature_extraction:
+            raise FileNotFoundError(
+                f"Timed experiment requires pre-extracted features: {feature_path}"
+            )
+        if config.image_feature_path:
+            raise FileNotFoundError(f"image_feature_path not found: {feature_path}")
+        ensure_internvit_features(
+            internvit_dir  = config.internvit_dir,
+            layer_ids      = config.layer_ids,
+            train_img_dir  = config.train_img_dir,
+            test_img_dir   = config.test_img_dir,
+            model_name     = config.internvit_model,
+            device         = str(_device),
+            batch_size     = int(cfg.extract_batch_size),
+        )
 
     internvit_lookup = InternViTFeatureLookup(
-        feature_path=os.path.join(config.internvit_dir, "internvit_features.npy"),
+        feature_path=feature_path,
     )
 
     output_dir = HydraConfig.get().runtime.output_dir
     os.makedirs(output_dir, exist_ok=True)
     logger.info(f"Output dir: {output_dir}")
+
+    # Persist the full loguru log to a file alongside all other outputs.
+    log_file = os.path.join(output_dir, "train.log")
+    logger.add(log_file, level="INFO", format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | {name}:{function}:{line} - {message}")
 
     # Save a human-readable copy of the config alongside results
     config_dump_path = os.path.join(output_dir, "config_used.yaml")
