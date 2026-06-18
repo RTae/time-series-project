@@ -1,6 +1,6 @@
 """
 Run this on the training server to pre-compute and save EEG + image embeddings.
-Outputs three small files that can be transferred locally to generate the retrieval figure.
+Outputs four small files that can be transferred locally to generate the retrieval figure.
 
 Usage:
     python scripts/save_embeddings.py --subject 7
