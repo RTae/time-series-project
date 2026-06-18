@@ -138,9 +138,9 @@ def run(subject: int, n_failures: int, embeddings_dir: str, test_img_dir: str) -
         print("No wrong predictions — skipping failure visualization.")
         return
 
-    # Sort wrong concepts by their best similarity score (ascending = hardest)
-    best_sim_among_wrong = sim[wrong_concepts, wrong_concepts]
-    fail_order  = wrong_concepts[np.argsort(best_sim_among_wrong)]
+    # Sort wrong concepts by similarity to their own GT image (ascending = hardest)
+    gt_sim = sim[wrong_concepts, wrong_concepts]
+    fail_order  = wrong_concepts[np.argsort(gt_sim)]
     fail_idx    = fail_order[:n_failures]
 
     n_rows = len(fail_idx)
