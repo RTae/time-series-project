@@ -603,7 +603,7 @@ def main() -> None:
     port = 8080
     while port < 8100:
         try:
-            server_address = ('', port)
+            server_address = ('127.0.0.1', port)
             httpd = HTTPServer(server_address, DemoHTTPHandler)
             break
         except OSError:
