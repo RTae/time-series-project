@@ -271,21 +271,26 @@ class DemoHTTPHandler(BaseHTTPRequestHandler):
         elif path == "/api/image":
             concept = query.get("concept", [""])[0]
             image_file = query.get("file", [""])[0]
-            
+
             config = load_config()
-            img_dir = os.path.join(config.dataset_dir, "test_images")
-            img_path = os.path.join(img_dir, concept, image_file)
-            
-            if os.path.isfile(img_path):
+            img_dir = os.path.abspath(os.path.join(config.dataset_dir, "test_images"))
+            requested = os.path.abspath(os.path.join(img_dir, concept, image_file))
+
+            # Prevent path traversal: requested path must stay within img_dir
+            if not requested.startswith(img_dir + os.sep):
+                self.send_response(400)
+                self.end_headers()
+                return
+
+            if os.path.isfile(requested):
                 self.send_response(200)
                 self.send_header("Content-Type", "image/jpeg")
                 self.end_headers()
-                with open(img_path, "rb") as f:
+                with open(requested, "rb") as f:
                     self.wfile.write(f.read())
             else:
                 self.send_response(404)
                 self.end_headers()
-        else:
             self.send_response(404)
             self.end_headers()
             
