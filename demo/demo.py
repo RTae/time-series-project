@@ -34,6 +34,8 @@ DEFAULT_AVERAGE = "true"
 # ---------------------------------------------------------------------------
 
 _dataset_cache = {}
+_model_cache = {}       # checkpoint_path -> model
+_gallery_cache = {}     # checkpoint_path -> (concepts, concept_to_file, zI)
 
 def load_config() -> Config:
     from omegaconf import OmegaConf
@@ -95,21 +97,50 @@ def plot_eeg(eeg_tensor: torch.Tensor, is_averaged: bool) -> str:
     return base64.b64encode(buf.getvalue()).decode('utf-8')
 
 
+def _get_model(checkpoint_path: str, config: Config):
+    """Return a cached (model, device) for the given checkpoint path."""
+    if checkpoint_path not in _model_cache:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = make_model(config, device)
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint["model"])
+        model.eval()
+        _model_cache[checkpoint_path] = (model, device)
+    return _model_cache[checkpoint_path]
+
+
+def _get_gallery(checkpoint_path: str, dataset, config: Config, model, device):
+    """Return cached (concepts, concept_to_file, zI) for the given checkpoint path."""
+    if checkpoint_path not in _gallery_cache:
+        concepts = sorted(list(set(dataset.image_meta_data['test_img_concepts'])))
+        concept_to_file = {}
+        for i in range(len(dataset.image_meta_data['test_img_concepts'])):
+            c = dataset.image_meta_data['test_img_concepts'][i]
+            f = dataset.image_meta_data['test_img_files'][i]
+            if c not in concept_to_file:
+                concept_to_file[c] = f
+
+        feature_path = os.path.join(config.internvit_dir, "internvit_features.npy")
+        lookup = InternViTFeatureLookup(feature_path=feature_path)
+        files = [concept_to_file[c] for c in concepts]
+        gallery_features = lookup.retrieve_batch(concepts, files)  # (200, 5, 3200)
+
+        with torch.no_grad():
+            zI = model.encode_image(gallery_features.to(device), subject_ids=None).cpu().numpy()  # (200, 512)
+
+        _gallery_cache[checkpoint_path] = (concepts, concept_to_file, zI)
+    return _gallery_cache[checkpoint_path]
+
+
 def run_inference(subject: int, target_concept: str, checkpoint_path: str) -> dict:
     config = load_config()
-    
+
     # Load cached or new test dataset
     dataset = get_dataset(subject, config)
-    
-    # Initialize model
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = make_model(config, device)
-    model.eval()
-    
-    # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint["model"])
-    
+
+    # Load cached model and checkpoint
+    model, device = _get_model(checkpoint_path, config)
+
     # Find the correct concept index in the 200 test set concepts
     concept_idx = -1
     for i, c in enumerate(dataset.image_meta_data['test_img_concepts']):
@@ -118,10 +149,10 @@ def run_inference(subject: int, target_concept: str, checkpoint_path: str) -> di
             break
     if concept_idx == -1:
         raise ValueError(f"Concept '{target_concept}' not found in the test dataset split")
-        
+
     # Get the 80 trials for this concept (using the repetitions factor)
     indices = [concept_idx * dataset.number_of_repetitions + r for r in range(dataset.number_of_repetitions)]
-    
+
     # Load all EEG trials for this concept (always averaged for decoder)
     eeg_tensors = []
     target_file = None
@@ -130,38 +161,23 @@ def run_inference(subject: int, target_concept: str, checkpoint_path: str) -> di
         eeg_tensors.append(eeg_tensor)
         if target_file is None:
             target_file = img_file
-            
+
     eeg_batch = torch.stack(eeg_tensors).to(device)  # (N_trials, 17, 100)
-    
+
     # Compute average EEG embedding
     with torch.no_grad():
         zE_trials = model.embed(eeg_batch)  # (N_trials, 512)
         zE = torch.nn.functional.normalize(zE_trials.mean(dim=0, keepdim=True), dim=1).cpu().numpy()  # (1, 512)
-        
-    # Get test concept gallery
-    concepts = sorted(list(set(dataset.image_meta_data['test_img_concepts'])))
-    concept_to_file = {}
-    for i in range(len(dataset.image_meta_data['test_img_concepts'])):
-        c = dataset.image_meta_data['test_img_concepts'][i]
-        f = dataset.image_meta_data['test_img_files'][i]
-        if c not in concept_to_file:
-            concept_to_file[c] = f
-            
-    # Retrieve & encode gallery image features
-    feature_path = os.path.join(config.internvit_dir, "internvit_features.npy")
-    lookup = InternViTFeatureLookup(feature_path=feature_path)
-    files = [concept_to_file[c] for c in concepts]
-    gallery_features = lookup.retrieve_batch(concepts, files)  # (200, 5, 3200)
-    
-    with torch.no_grad():
-        zI = model.encode_image(gallery_features.to(device), subject_ids=None).cpu().numpy()  # (200, 512)
-        
+
+    # Load cached gallery embeddings
+    concepts, concept_to_file, zI = _get_gallery(checkpoint_path, dataset, config, model, device)
+
     # Compute cosine similarity
     from sklearn.metrics.pairwise import cosine_similarity
     sim = cosine_similarity(zE, zI)[0]
-    
+
     top_indices = np.argsort(-sim)[:5]
-    
+
     results = []
     for rank, idx in enumerate(top_indices, 1):
         results.append({
@@ -170,7 +186,7 @@ def run_inference(subject: int, target_concept: str, checkpoint_path: str) -> di
             "image_file": concept_to_file[concepts[idx]],
             "similarity": float(sim[idx])
         })
-        
+
     return {
         "results": results,
         "target_file": target_file
