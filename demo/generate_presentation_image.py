@@ -13,7 +13,7 @@ project_root = os.path.dirname(demo_dir)
 sys.path.insert(0, project_root)
 
 from src.dataset import ThingsEEGDataset
-from src.models.supaeeg import SUPAEEG
+# from src.models.supaeeg import SUPAEEG
 from src.encoders.vision_encoder import InternViTFeatureLookup
 from src.utilities import Config, make_model
 
