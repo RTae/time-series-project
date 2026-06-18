@@ -251,7 +251,10 @@ class DemoHTTPHandler(BaseHTTPRequestHandler):
                     "eeg_plot": eeg_plot
                 })
             except Exception as e:
-                self.send_error(500, str(e))
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode("utf-8"))
                 
         elif path == "/api/decode":
             try:
