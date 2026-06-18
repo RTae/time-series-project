@@ -48,11 +48,12 @@ def run(subject: int, n_concepts: int, seed: int, output_path: str,
     # Randomly select concepts to visualize
     rng = random.Random(seed)
     selected = rng.sample(all_concepts, n_concepts)
+    concept_to_idx = {c: i for i, c in enumerate(all_concepts)}
 
     rows = []
     for concept in selected:
-        concept_idx = all_concepts.index(concept)
-        zE = eeg_emb[concept_idx:concept_idx+1]  # (1, 512)
+        concept_idx = concept_to_idx[concept]
+        zE = eeg_emb[concept_idx:concept_idx + 1]  # (1, 512)
 
         sim = (zE @ img_emb.T)[0]  # (200,)
         top5_idx = np.argsort(-sim)[:5]
