@@ -132,7 +132,7 @@ def run(subject: int, n_failures: int, embeddings_dir: str, test_img_dir: str) -
     print(f"Saved: {out_c}")
 
     # ── D: Failure case visualization ─────────────────────────────────────────
-    # Pick concepts where Top-1 is wrong; rank by max top-5 similarity (hardest first)
+    # Pick concepts where Top-1 is wrong; rank by similarity to their own GT image (hardest first)
     wrong_concepts = np.where(top1_acc == 0)[0]
     if len(wrong_concepts) == 0:
         print("No wrong predictions — skipping failure visualization.")
